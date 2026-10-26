@@ -20,3 +20,6 @@ build-backend = "uv_build"
 
 [tool.fastapi]
 entrypoint = "janus.main:app"
+
+[tool.pytest.ini_options]
+env_files = [".env"]

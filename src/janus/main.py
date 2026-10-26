@@ -29,10 +29,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-asyncClient = AsyncClient(headers={"Authorization": "Bearer " + API_KEY})
-
 async def generate(responseRequest: ResponseRequest):
-    async with asyncClient.stream("POST", "/responses", json=responseRequest.model_dump(exclude_none=True)) as response :
+    async with app.state.asyncClient.stream("POST", "/responses", json=responseRequest.model_dump(exclude_none=True)) as response :
         async for chunk in response.aiter_raw():
             yield chunk
 
@@ -42,7 +40,7 @@ async def forwardCompletion(responseRequest: ResponseRequest):
     if responseRequest.stream:
         return StreamingResponse(generate(responseRequest), media_type="text/event-stream")
     else:
-        response = await asyncClient.post("/responses", json=responseRequest.model_dump(exclude_none=True))
+        response = await app.state.asyncClient.post("/responses", json=responseRequest.model_dump(exclude_none=True))
         return JSONResponse(content=response.json(), status_code=response.status_code)
 
         
