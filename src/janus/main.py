@@ -1,47 +1,102 @@
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse, JSONResponse
-from janus.models import ResponseRequest
-from httpx import AsyncClient, Timeout
+import sys
 from contextlib import asynccontextmanager
-
-from dotenv import load_dotenv
 from os import getenv
+from typing import Annotated, Any
+
+import httpx
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
+from httpx import AsyncClient, Timeout
+from redis.asyncio import Redis
+
+from janus.models import ResponseRequest
 
 load_dotenv()
 
-API_KEY = getenv("NVIDIA_API_KEY") or ""
-BASE_URL = getenv("BASE_URL") or ""
+API_KEY = getenv("NVIDIA_API_KEY", "")
+BASE_URL = getenv("BASE_URL", "")
+REDIS_URL = getenv("REDIS_URL", "redis://localhost:6379")
 
-if API_KEY == "" or BASE_URL == "":
-    print("Environment variables haven't been set up")
-    exit(1) 
+if not API_KEY or not BASE_URL:
+    sys.exit("NVIDIA_API_KEY and BASE_URL must be set")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with AsyncClient(base_url=BASE_URL,
-                            headers=
-                                {"Authorization": "Bearer " + API_KEY, 
-                                "Accept": "application/json"}, 
-                           timeout=Timeout(120.0, connect=10.0)) as client:
-        
-        app.state.asyncClient = client
+    async with (
+        AsyncClient(
+            base_url=BASE_URL,
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            timeout=Timeout(120.0, connect=10.0),
+        ) as client,
+        Redis.from_url(REDIS_URL, decode_responses=True) as redis,
+    ):
+        await redis.ping()
+
+        app.state.http = client
+        app.state.redis = redis
         yield
 
 
 app = FastAPI(lifespan=lifespan)
-async def generate(responseRequest: ResponseRequest):
-    async with app.state.asyncClient.stream("POST", "/responses", json=responseRequest.model_dump(exclude_none=True)) as response :
-        async for chunk in response.aiter_raw():
+
+
+def get_http(request: Request) -> AsyncClient:
+    return request.app.state.http
+
+
+def get_redis(request: Request) -> Redis:
+    return request.app.state.redis
+
+
+HttpClient = Annotated[AsyncClient, Depends(get_http)]
+RedisClient = Annotated[Redis, Depends(get_redis)]
+
+
+async def stream_and_close(upstream: httpx.Response):
+    try:
+        async for chunk in upstream.aiter_bytes():
             yield chunk
+    finally:
+        await upstream.aclose()
 
 
 @app.post("/v1/responses")
-async def forwardCompletion(responseRequest: ResponseRequest):
-    if responseRequest.stream:
-        return StreamingResponse(generate(responseRequest), media_type="text/event-stream")
-    else:
-        response = await app.state.asyncClient.post("/responses", json=responseRequest.model_dump(exclude_none=True))
-        return JSONResponse(content=response.json(), status_code=response.status_code)
+async def forward_completion(body: ResponseRequest, http: HttpClient):
+    payload: dict[str, Any] = body.model_dump(exclude_none=True)
 
-        
+    try:
+        if not body.stream:
+            upstream = await http.post(
+                "/responses", json=payload, headers={"Accept": "application/json"}
+            )
+            return Response(
+                content=upstream.content,
+                status_code=upstream.status_code,
+                media_type=upstream.headers.get("content-type", "application/json"),
+            )
 
+        req = http.build_request(
+            "POST", "/responses", json=payload,
+            headers={"Accept": "text/event-stream"},
+        )
+        upstream = await http.send(req, stream=True)
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Upstream timed out")
+    except httpx.RequestError:
+        raise HTTPException(status_code=502, detail="Upstream unreachable")
+
+    if upstream.status_code >= 400:
+        content = await upstream.aread()
+        await upstream.aclose()
+        return Response(
+            content=content,
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type", "application/json"),
+        )
+
+    return StreamingResponse(
+        stream_and_close(upstream),
+        media_type="text/event-stream",
+    )
