@@ -1,3 +1,4 @@
+import logging
 import sys
 from contextlib import asynccontextmanager
 from os import getenv
@@ -12,11 +13,14 @@ from redis.asyncio import Redis
 
 from janus.models import ResponseRequest
 
+logger = logging.getLogger(__name__)
 load_dotenv()
 
 API_KEY = getenv("NVIDIA_API_KEY", "")
 BASE_URL = getenv("BASE_URL", "")
 REDIS_URL = getenv("REDIS_URL", "redis://localhost:6379")
+
+logger.info("ENV loaded")
 
 if not API_KEY or not BASE_URL:
     sys.exit("NVIDIA_API_KEY and BASE_URL must be set")
@@ -33,6 +37,8 @@ async def lifespan(app: FastAPI):
         Redis.from_url(REDIS_URL, decode_responses=True) as redis,
     ):
         await redis.ping()
+
+        logger.info("HTTP client and Redis ready")
 
         app.state.http = client
         app.state.redis = redis
@@ -85,6 +91,7 @@ async def forward_completion(body: ResponseRequest, http: HttpClient):
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Upstream timed out")
     except httpx.RequestError:
+        logger.error("Upstream request failed")
         raise HTTPException(status_code=502, detail="Upstream unreachable")
 
     if upstream.status_code >= 400:
