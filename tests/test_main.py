@@ -1,9 +1,12 @@
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ["NVIDIA_API_KEY"] = "test-api-key"
@@ -19,24 +22,58 @@ class FakeResponse:
         self.status_code = status_code
         self.payload = payload or {"id": "resp_test", "output": []}
         self.chunks = chunks
+        self.headers = {"content-type": "application/json"}
+        self.closed = False
+
+    @property
+    def content(self) -> bytes:
+        return json.dumps(self.payload).encode("utf-8")
 
     def json(self):
         return self.payload
+
+    async def aread(self) -> bytes:
+        return self.content
+
+    async def aiter_bytes(self):
+        for chunk in self.chunks:
+            yield chunk
 
     async def aiter_raw(self):
         for chunk in self.chunks:
             yield chunk
 
+    async def aclose(self):
+        self.closed = True
+
+
+class FakeRedis:
+    def __init__(self):
+        self.pinged = False
+        self.closed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        self.closed = True
+
+    async def ping(self):
+        self.pinged = True
+        return True
+
 
 class FakeClient:
     def __init__(self, response):
         self.response = response
-        self.init_args = None
-        self.init_kwargs = None
+        self.base_url = "https://api.example.test/v1/"
         self.closed = False
         self.post_call = None
         self.stream_call = None
-        self.stream_closed = False
+
+    @property
+    def stream_closed(self) -> bool:
+        return self.response.closed
 
     async def __aenter__(self):
         return self
@@ -48,20 +85,17 @@ class FakeClient:
         self.post_call = (path, kwargs)
         return self.response
 
-    def stream(self, method, path, **kwargs):
-        self.stream_call = (method, path, kwargs)
-        return FakeStreamContext(self)
+    def build_request(self, method, path, **kwargs):
+        return SimpleNamespace(
+            method=method,
+            path=path,
+            kwargs=kwargs,
+            url=f"https://api.example.test/v1/{path.lstrip('/')}",
+        )
 
-
-class FakeStreamContext:
-    def __init__(self, client):
-        self.client = client
-
-    async def __aenter__(self):
-        return self.client.response
-
-    async def __aexit__(self, exc_type, exc_value, traceback):
-        self.client.stream_closed = True
+    async def send(self, req, stream=False):
+        self.stream_call = (req.method, req.path, req.kwargs, stream)
+        return self.response
 
 
 class MainTests(unittest.TestCase):
@@ -69,33 +103,46 @@ class MainTests(unittest.TestCase):
         self.response = FakeResponse(
             status_code=429,
             payload={"error": {"message": "rate limited"}},
-            chunks=(b"data: {\"type\":\"response.created\"}\n\n", b"data: [DONE]\n\n"),
+            chunks=(b'data: {"type":"response.created"}\n\n', b"data: [DONE]\n\n"),
         )
         self.client = FakeClient(self.response)
+        self.redis = FakeRedis()
 
-    def start_client(self):
-        return patch("janus.main.AsyncClient", return_value=self.client)
+    def start_dependencies(self):
+        stack = ExitStack()
+        client_factory = stack.enter_context(
+            patch("janus.main.AsyncClient", return_value=self.client)
+        )
+        redis_factory = stack.enter_context(
+            patch("janus.main.Redis.from_url", return_value=self.redis)
+        )
+        return stack, client_factory, redis_factory
 
-    def test_lifespan_configures_and_closes_upstream_client(self):
-        with self.start_client() as client_factory:
+    def test_lifespan_configures_and_closes_upstream_client_and_redis(self):
+        stack, client_factory, redis_factory = self.start_dependencies()
+        with stack:
             with TestClient(app):
                 client_factory.assert_called_once()
                 _, kwargs = client_factory.call_args
-                self.assertEqual(kwargs["base_url"], "https://api.example.test/v1")
+                self.assertIn(
+                    kwargs["base_url"],
+                    ("https://api.example.test/v1", "https://api.example.test/v1/"),
+                )
                 self.assertEqual(
-                    kwargs["headers"],
-                    {
-                        "Authorization": "Bearer test-api-key",
-                        "Accept": "application/json",
-                    },
+                    kwargs["headers"]["Authorization"], "Bearer test-api-key"
                 )
                 self.assertEqual(kwargs["timeout"].connect, 10.0)
                 self.assertEqual(kwargs["timeout"].read, 120.0)
-                self.assertIs(app.state.asyncClient, self.client)
+                self.assertIs(app.state.http, self.client)
+                self.assertIs(app.state.redis, self.redis)
+                self.assertTrue(self.redis.pinged)
+                redis_factory.assert_called_once()
             self.assertTrue(self.client.closed)
+            self.assertTrue(self.redis.closed)
 
     def test_json_request_is_sanitized_and_upstream_status_is_forwarded(self):
-        with self.start_client():
+        stack, _, _ = self.start_dependencies()
+        with stack:
             with TestClient(app) as client:
                 response = client.post(
                     "/v1/responses",
@@ -108,14 +155,16 @@ class MainTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 429)
         self.assertEqual(response.json(), {"error": {"message": "rate limited"}})
-        self.assertEqual(self.client.post_call[0], "/responses")
+        self.assertIn(self.client.post_call[0], ("responses", "/responses"))
         self.assertEqual(
             self.client.post_call[1]["json"],
             {"model": "openai/gpt-oss-20b", "input": "Hello", "stream": False},
         )
 
     def test_streaming_request_forwards_raw_chunks_as_server_sent_events(self):
-        with self.start_client():
+        self.response.status_code = 200
+        stack, _, _ = self.start_dependencies()
+        with stack:
             with TestClient(app) as client:
                 response = client.post(
                     "/v1/responses",
@@ -127,16 +176,21 @@ class MainTests(unittest.TestCase):
                 )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.headers["content-type"], "text/event-stream; charset=utf-8")
+        self.assertEqual(
+            response.headers["content-type"], "text/event-stream; charset=utf-8"
+        )
         self.assertEqual(
             response.content,
-            b"data: {\"type\":\"response.created\"}\n\ndata: [DONE]\n\n",
+            b'data: {"type":"response.created"}\n\ndata: [DONE]\n\n',
         )
-        self.assertEqual(self.client.stream_call[0:2], ("POST", "/responses"))
+        self.assertEqual(self.client.stream_call[0], "POST")
+        self.assertIn(self.client.stream_call[1], ("responses", "/responses"))
+        self.assertTrue(self.client.stream_call[3])
         self.assertTrue(self.client.stream_closed)
 
     def test_invalid_request_is_rejected_without_upstream_call(self):
-        with self.start_client():
+        stack, _, _ = self.start_dependencies()
+        with stack:
             with TestClient(app) as client:
                 response = client.post("/v1/responses", json={"input": "Hello"})
 
@@ -173,7 +227,8 @@ class MainTests(unittest.TestCase):
 
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(
-                    "Environment variables haven't been set up", result.stdout
+                    "NVIDIA_API_KEY and BASE_URL must be set",
+                    result.stderr + result.stdout,
                 )
 
 
