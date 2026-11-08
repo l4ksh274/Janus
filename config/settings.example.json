@@ -1,0 +1,12 @@
+{
+  "cache": {
+    "exact_enabled": true,
+    "semantic_enabled": true,
+    "ttl_seconds": 3600,
+    "max_semantic_distance": 0.08
+  },
+  "performance": {
+    "max_concurrent_embeds": 2,
+    "max_stream_buffer_bytes": 1000000
+  }
+}
