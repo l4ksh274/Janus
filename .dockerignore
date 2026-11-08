@@ -1,0 +1,10 @@
+.env
+.git
+.pytest_cache
+.venv
+__pycache__
+*.py[cod]
+tests
+locustfile.py
+mock_server.py
+report.html
